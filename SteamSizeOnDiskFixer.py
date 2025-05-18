@@ -1,12 +1,13 @@
 import os
 import re
+import ctypes
 
-# Define all your known Steam library paths (to their steamapps folders)
+# All known Steam library paths (to their steamapps folders)
 STEAM_LIBRARIES = [
     r"C:\Program Files (x86)\Steam\steamapps",
     r"F:\SteamLibrary\steamapps",
     r"E:\Games\SteamLibrary\steamapps",
-    r"D:\SteamLibrary\steamapps"  # Make sure this matches your new folder name
+    r"D:\SteamLibrary\steamapps"  # Make sure this matches your folder names
 ]
 
 def parse_acf(acf_path):
@@ -32,17 +33,29 @@ def update_acf(acf_path, new_size):
     with open(acf_path, "w", encoding='utf-8') as f:
         f.write(content)
 
+def get_file_size_on_disk(path):
+    """Return size on disk using Windows API (GetCompressedFileSizeW)."""
+    if not os.path.exists(path):
+        return 0
+    try:
+        GetCompressedFileSizeW = ctypes.windll.kernel32.GetCompressedFileSizeW
+        GetCompressedFileSizeW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]
+        high = ctypes.c_ulong(0)
+        low = GetCompressedFileSizeW(path, ctypes.byref(high))
+        size = (high.value << 32) + low
+        return size
+    except Exception as e:
+        print(f"Error getting disk size for {path}: {e}")
+        return 0
+
 def get_folder_size(path):
-    """Calculate the total size of files in a folder."""
+    """Calculate size on disk for all files in a folder."""
     total_size = 0
     for dirpath, _, filenames in os.walk(path):
         for f in filenames:
-            try:
-                fp = os.path.join(dirpath, f)
-                if os.path.isfile(fp):
-                    total_size += os.path.getsize(fp)
-            except Exception as e:
-                print(f"Error accessing {fp}: {e}")
+            fp = os.path.join(dirpath, f)
+            if os.path.isfile(fp):
+                total_size += get_file_size_on_disk(fp)
     return total_size
 
 def main():
@@ -73,7 +86,7 @@ def main():
 
                 if os.path.isdir(game_path):
                     size = get_folder_size(game_path)
-                    print(f"✅ Updating {file} for '{install_dir}' - {size / 1024**3:.2f} GB")
+                    print(f"✅ Updating {file} for '{install_dir}' - Size on disk: {size / 1024**3:.2f} GB")
                     update_acf(acf_path, size)
                 else:
                     print(f"🚫 Game folder not found for {install_dir} at {game_path}")
