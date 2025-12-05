@@ -1,34 +1,57 @@
 import os
 import re
+import shutil
 import ctypes
+from ctypes import wintypes
 
-# All known Steam library paths (to their steamapps folders)
+# Paths to your Steam libraries (steamapps folders)
 STEAM_LIBRARIES = [
     r"C:\Program Files (x86)\Steam\steamapps",
     r"F:\SteamLibrary\steamapps",
     r"E:\Games\SteamLibrary\steamapps",
-    r"D:\SteamLibrary\steamapps"  # Make sure this matches your folder names
+    r"D:\SteamLibrary\steamapps"
 ]
 
 def parse_acf(acf_path):
-    """Parse .acf into a flat dictionary."""
+    """Parse .acf into a flat dictionary of key/value pairs."""
     with open(acf_path, encoding='utf-8') as f:
         text = f.read()
+    return {m.group(1): m.group(2) for m in re.finditer(r'"([^"]+)"\s+"([^"]+)"', text)}
 
-    flat = {}
-    for match in re.finditer(r'"([^"]+)"\s+"([^"]+)"', text):
-        flat[match.group(1)] = match.group(2)
-    return flat
+def backup_acf(acf_path):
+    """Create a backup copy of the ACF file before modifying."""
+    backup_path = acf_path + ".bak"
+    if not os.path.exists(backup_path):
+        shutil.copy2(acf_path, backup_path)
+        print(f"📦 Backup created: {backup_path}")
+    else:
+        print(f"📦 Backup already exists: {backup_path}")
 
-def update_acf(acf_path, new_size):
-    """Update the SizeOnDisk field in an ACF file."""
+def update_acf(acf_path, new_size_bytes):
+    """Update or insert the SizeOnDisk field in an ACF file (in bytes)."""
+    backup_acf(acf_path)
+
     with open(acf_path, encoding='utf-8') as f:
         content = f.read()
 
+    # allow replacing negative values too
     if '"SizeOnDisk"' in content:
-        content = re.sub(r'"SizeOnDisk"\s*"\d+"', f'\t"SizeOnDisk"\t"{new_size}"', content)
+        # Use a replacement function to avoid group reference issues
+        def repl(match):
+            return f'{match.group(1)}{new_size_bytes}{match.group(2)}'
+
+        content = re.sub(
+            r'("SizeOnDisk"\s*")-?\d+(")',
+            repl,
+            content
+        )
     else:
-        content = content.rstrip()[:-1] + f'\n\t"SizeOnDisk"\t"{new_size}"\n' + '}'
+        # Insert before final closing brace
+        content = re.sub(
+            r'}\s*$',
+            f'\t"SizeOnDisk"\t"{new_size_bytes}"\n}}',
+            content
+        )
 
     with open(acf_path, "w", encoding='utf-8') as f:
         f.write(content)
@@ -39,17 +62,35 @@ def get_file_size_on_disk(path):
         return 0
     try:
         GetCompressedFileSizeW = ctypes.windll.kernel32.GetCompressedFileSizeW
-        GetCompressedFileSizeW.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)]
-        high = ctypes.c_ulong(0)
+        GetCompressedFileSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+        # restype as DWORD (unsigned 32-bit)
+        GetCompressedFileSizeW.restype = wintypes.DWORD
+
+        high = wintypes.DWORD(0)
+        ctypes.windll.kernel32.SetLastError(0)
         low = GetCompressedFileSizeW(path, ctypes.byref(high))
-        size = (high.value << 32) + low
-        return size
+
+        # Check for error condition
+        if int(low) == 0xFFFFFFFF:
+            err = ctypes.windll.kernel32.GetLastError()
+            if err != 0:
+                raise OSError(f"GetCompressedFileSizeW failed with error {err}")
+
+        # Force unsigned 32-bit values and combine into unsigned 64-bit
+        low_u = ctypes.c_uint32(int(low)).value
+        high_u = ctypes.c_uint32(int(high.value)).value
+        size = (high_u << 32) | low_u
+        return int(size)
     except Exception as e:
-        print(f"Error getting disk size for {path}: {e}")
-        return 0
+        # fallback to logical file size if API fails
+        try:
+            return os.path.getsize(path)
+        except Exception:
+            print(f"Error getting disk size for {path}: {e}")
+            return 0
 
 def get_folder_size(path):
-    """Calculate size on disk for all files in a folder."""
+    """Calculate size on disk for all files in a folder (bytes)."""
     total_size = 0
     for dirpath, _, filenames in os.walk(path):
         for f in filenames:
@@ -64,30 +105,24 @@ def main():
             print(f"⚠️ Skipping missing path: {library}")
             continue
 
-        try:
-            files = os.listdir(library)
-        except Exception as e:
-            print(f"❌ Error listing directory {library}: {e}")
-            continue
-
-        for file in files:
+        for file in os.listdir(library):
             if file.startswith("appmanifest_") and file.endswith(".acf"):
                 acf_path = os.path.join(library, file)
                 acf_data = parse_acf(acf_path)
+
+                appid = acf_data.get("appid")
                 install_dir = acf_data.get("installdir")
 
                 if not install_dir:
                     print(f"❓ No installdir in {file}")
                     continue
 
-                # Correct: steamapps/common/GameFolder
-                common_path = os.path.join(library, "common")
-                game_path = os.path.join(common_path, install_dir)
+                game_path = os.path.join(library, "common", install_dir)
 
                 if os.path.isdir(game_path):
-                    size = get_folder_size(game_path)
-                    print(f"✅ Updating {file} for '{install_dir}' - Size on disk: {size / 1024**3:.2f} GB")
-                    update_acf(acf_path, size)
+                    size_bytes = get_folder_size(game_path)
+                    print(f"✅ AppID {appid} ({install_dir}) - Actual size: {size_bytes / 1024**3:.2f} GB ({size_bytes} bytes)")
+                    update_acf(acf_path, size_bytes)
                 else:
                     print(f"🚫 Game folder not found for {install_dir} at {game_path}")
 
